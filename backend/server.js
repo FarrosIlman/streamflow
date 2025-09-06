@@ -34,7 +34,10 @@ const upload = multer({ storage: storage });
 
 // --- 4. MIDDLEWARE ---
 // Mengizinkan request dari frontend (yang berjalan di port berbeda)
-app.use(cors());
+const corsOptions = {
+  origin: 'https://streamflow-frontend.vercel.app/' // <-- GANTI DENGAN URL VERCEL ANDA
+};
+app.use(cors(corsOptions));
 // Memungkinkan server untuk membaca data JSON dari body request
 app.use(express.json());
 
