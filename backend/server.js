@@ -11,21 +11,15 @@ const app = express();
 const PORT = 3000;
 
 // --- 3. KONFIGURASI UNTUK UPLOAD FILE (MULTER) ---
-// Tentukan lokasi folder untuk menyimpan file yang di-upload
 const uploadsDir = path.join(__dirname, 'uploads');
-
-// Buat folder 'uploads' jika belum ada
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
-
-// Atur bagaimana file akan disimpan
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-        cb(null, uploadsDir); // Simpan file di dalam folder 'uploads'
+        cb(null, uploadsDir);
     },
     filename: (req, file, cb) => {
-        // Buat nama file yang unik untuk menghindari konflik nama yang sama
         const safeFilename = file.originalname.replace(/\s/g, '_');
         cb(null, Date.now() + '-' + safeFilename);
     }
@@ -33,106 +27,97 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 
 // --- 4. MIDDLEWARE ---
-// Mengizinkan request dari frontend (yang berjalan di port berbeda)
 const corsOptions = {
-  origin: 'https://streamflow-frontend.vercel.app/' // <-- GANTI DENGAN URL VERCEL ANDA
+    origin: 'https://streamflow-frontend.vercel.app'
 };
 app.use(cors(corsOptions));
-// Memungkinkan server untuk membaca data JSON dari body request
-app.use(express.json());
+// Naikkan limit upload agar bisa menerima file besar
+app.use(express.json({ limit: '1000mb' }));
+app.use(express.urlencoded({ limit: '1000mb', extended: true }));
 
-// --- 5. PENYIMPANAN STATE APLIKASI ---
-// Objek untuk melacak semua proses FFmpeg yang sedang berjalan.
-// Key: streamId, Value: proses child_process
-const runningStreams = {};
+// --- 5. HAPUS PENYIMPANAN STATE DI MEMORI ---
+// Variabel runningStreams tidak lagi dibutuhkan karena PM2 yang akan melacak proses.
+// const runningStreams = {}; // <-- HAPUS ATAU BERI KOMENTAR PADA BARIS INI
 
-// --- 6. DEFINISI API ENDPOINTS ---
+// --- 6. DEFINISI API ENDPOINTS (YANG SUDAH DIMODIFIKASI) ---
 
-/**
- * @route   POST /api/upload
- * @desc    Menerima upload satu file video dari frontend
- * @access  Public
- */
 app.post('/api/upload', upload.single('video'), (req, res) => {
     if (!req.file) {
         return res.status(400).json({ message: "No file uploaded." });
     }
-    // Jika berhasil, kirim kembali path absolut dari file yang tersimpan di server
     res.status(201).json({ serverPath: req.file.path });
 });
 
-/**
- * @route   POST /api/stream/start
- * @desc    Memulai proses streaming FFmpeg
- * @access  Public
- */
+// MODIFIKASI ENDPOINT START
 app.post('/api/stream/start', (req, res) => {
     const { videoPath, youtubeKey, facebookKey } = req.body;
-
     if (!videoPath || !youtubeKey) {
         return res.status(400).json({ message: "Server video path and YouTube key are required." });
     }
-
+    
     const streamId = `stream_${Date.now()}`;
-
-    // Perintah FFmpeg dengan opsi looping (-stream_loop -1)
-    let command = `ffmpeg -stream_loop -1 -re -i "${videoPath}" -c:v copy -c:a copy -f flv "rtmp://a.rtmp.youtube.com/live2/${youtubeKey}"`;
-
-    // Tambahkan tujuan Facebook jika stream key-nya ada
+    const streamName = `ffmpeg-${streamId}`; // Buat nama unik untuk proses PM2
+    
+    // Siapkan argumen untuk FFmpeg
+    let ffmpegArgs = `-stream_loop -1 -re -i "${videoPath}" -c:v copy -c:a copy -f flv "rtmp://a.rtmp.youtube.com/live2/${youtubeKey}"`;
     if (facebookKey) {
-        command += ` -f flv "rtmp://live-api-s.facebook.com:443/rtmp/${facebookKey}"`;
+        ffmpegArgs += ` -f flv "rtmp://live-api-s.facebook.com:443/rtmp/${facebookKey}"`;
     }
+    
+    // Perintahkan PM2 untuk menjalankan ffmpeg. Tanda '--' penting untuk memisahkan argumen PM2 dan argumen FFmpeg
+    const command = `pm2 start ffmpeg --name "${streamName}" -- ${ffmpegArgs}`;
 
-    console.log(`[${streamId}] Executing FFmpeg command:`);
-    console.log(command);
-
-    // Jalankan perintah FFmpeg sebagai proses turunan
-    const ffmpegProcess = exec(command);
-    runningStreams[streamId] = ffmpegProcess;
-
-    // Monitor output error dari FFmpeg untuk debugging
-    ffmpegProcess.stderr.on('data', (data) => {
-        console.error(`[${streamId}] FFMPEG STDERR: ${data}`);
-    });
-
-    // Hapus proses dari daftar saat streaming selesai atau gagal
-    ffmpegProcess.on('close', (code) => {
-        console.log(`[${streamId}] FFMPEG process exited with code ${code}`);
-        delete runningStreams[streamId];
-    });
-
-    res.status(202).json({
-        message: "Streaming process started successfully!",
-        streamId: streamId
+    console.log(`[${streamId}] Executing PM2 command: ${command}`);
+    exec(command, (error, stdout, stderr) => {
+        if (error) {
+            console.error(`exec error: ${error}`);
+            return res.status(500).json({ message: "Failed to start stream via PM2." });
+        }
+        res.status(202).json({
+            message: "Streaming process initiated via PM2!",
+            streamId: streamId
+        });
     });
 });
 
-/**
- * @route   POST /api/stream/stop/:streamId
- * @desc    Menghentikan proses streaming FFmpeg berdasarkan ID
- * @access  Public
- */
+// MODIFIKASI ENDPOINT STOP
 app.post('/api/stream/stop/:streamId', (req, res) => {
     const { streamId } = req.params;
-    const process = runningStreams[streamId];
+    const streamName = `ffmpeg-${streamId}`; // Bentuk kembali nama proses PM2
 
-    if (process) {
-        process.kill('SIGKILL'); // Hentikan proses secara paksa
-        // Proses penghapusan dari `runningStreams` akan ditangani oleh event 'close'
-        console.log(`[${streamId}] Stop request received. Killing process.`);
-        res.json({ message: `Stream ${streamId} stopped successfully.` });
-    } else {
-        res.status(404).json({ message: "Stream not found or already stopped." });
-    }
+    // Perintahkan PM2 untuk menghentikan dan menghapus proses
+    const command = `pm2 stop ${streamName} && pm2 delete ${streamName}`;
+
+    console.log(`Executing PM2 stop/delete command for ${streamName}`);
+    exec(command, (error, stdout, stderr) => {
+        // Abaikan error "process not found", karena mungkin sudah berhenti.
+        // Yang penting kita kirim pesan sukses ke frontend.
+        console.log(`PM2 stop stdout: ${stdout}`);
+        console.error(`PM2 stop stderr: ${stderr}`);
+        res.json({ message: `Stream ${streamId} stopped.` });
+    });
 });
 
-/**
- * @route   GET /api/streams
- * @desc    Mendapatkan daftar semua stream ID yang sedang aktif
- * @access  Public
- */
+// MODIFIKASI ENDPOINT GET STREAMS
 app.get('/api/streams', (req, res) => {
-    res.json({ activeStreams: Object.keys(runningStreams) });
+    // Gunakan 'pm2 jlist' untuk mendapatkan daftar proses dalam format JSON
+    exec('pm2 jlist', (error, stdout, stderr) => {
+        if (error) {
+            console.error(`exec error: ${error}`);
+            return res.status(500).json({ activeStreams: [] });
+        }
+        try {
+            const processes = JSON.parse(stdout);
+            // Saring hanya proses yang dimulai dengan 'ffmpeg-stream_'
+            const ffmpegProcesses = processes
+                .filter(p => p.name.startsWith('ffmpeg-stream_'))
+                .map(p => p.name.replace('ffmpeg-', '')); // Ambil streamId aslinya
+            res.json({ activeStreams: ffmpegProcesses });
+        } catch (e) {
+            console.error(`Error parsing PM2 jlist: ${e}`);
+            res.status(500).json({ activeStreams: [] });
+        }
+    });
 });
 
 // --- 7. JALANKAN SERVER ---
